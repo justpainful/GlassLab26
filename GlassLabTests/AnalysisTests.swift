@@ -180,7 +180,7 @@ final class ImageMetricsTests: XCTestCase {
 
 final class MeasurementModelTests: XCTestCase {
     func testNonFiniteValuesBecomeNA() {
-        let m = Measurement(name: "x", value: .nan, unit: "", provenance: .measured, algorithm: "a", version: "1", confidence: .high("t"), sampleCount: 1)
+        let m = GlassLab.Measurement(name: "x", value: .nan, unit: "", provenance: .measured, algorithm: "a", version: "1", confidence: .high("t"), sampleCount: 1)
         XCTAssertNil(m.value)
     }
 

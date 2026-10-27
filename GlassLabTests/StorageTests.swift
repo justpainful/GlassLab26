@@ -15,10 +15,10 @@ final class SerializationTests: XCTestCase {
     }
 
     func testMeasurementWithNaNSeriesRoundTrip() throws {
-        var m = Measurement(name: "x", value: 1.5, unit: "pt", provenance: .estimated, algorithm: "a", version: "1", confidence: .low("t"),
+        var m = GlassLab.Measurement(name: "x", value: 1.5, unit: "pt", provenance: .estimated, algorithm: "a", version: "1", confidence: .low("t"),
                             uncertainty: Uncertainty(halfWidth: 0.1, kind: .fitInterval), sampleCount: 3)
-        m.series = [Measurement.Series(label: "s", xUnit: "x", yUnit: "y", x: [0, 1], y: [.nan, 2])]
-        let back = try DataStore.decoder.decode(Measurement.self, from: DataStore.encoder.encode(m))
+        m.series = [GlassLab.Measurement.Series(label: "s", xUnit: "x", yUnit: "y", x: [0, 1], y: [.nan, 2])]
+        let back = try DataStore.decoder.decode(GlassLab.Measurement.self, from: DataStore.encoder.encode(m))
         XCTAssertEqual(back.value, 1.5)
         XCTAssertTrue(back.series![0].y[0].isNaN)
         XCTAssertEqual(back.uncertainty?.kind, .fitInterval)
@@ -79,7 +79,7 @@ final class DataStoreTests: XCTestCase {
         e.referenceFrames = [try makeFrame(store, s.id, role: .reference)]
         e.resultFrames = [try makeFrame(store, s.id, role: .test)]
         e.analyses = [AnalysisRun(startedAt: Date(), finishedAt: Date(), appVersion: "t", algorithmVersions: [:],
-                                  measurements: [Measurement(name: "m, 1", value: 2, unit: "pt", provenance: .measured, algorithm: "a", version: "1", confidence: .high("x"), sampleCount: 1),
+                                  measurements: [GlassLab.Measurement(name: "m, 1", value: 2, unit: "pt", provenance: .measured, algorithm: "a", version: "1", confidence: .high("x"), sampleCount: 1),
                                                  .unavailable("n", unit: "", algorithm: "a", version: "1", reason: "because")],
                                   derivedFrames: [], log: [], validity: .valid)]
         store.upsert(experiment: e, in: s.id)
