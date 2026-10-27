@@ -1,0 +1,78 @@
+# XcodeGen spec. Generate the Xcode project with:  xcodegen generate
+# The generated GlassLab.xcodeproj is not committed; CI generates it on every run.
+name: GlassLab
+options:
+  bundleIdPrefix: com.justpainful
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+settings:
+  base:
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+    DEVELOPMENT_TEAM: ${APPLE_TEAM_ID}
+targets:
+  GlassLab:
+    type: application
+    platform: iOS
+    sources:
+      - path: GlassLab
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.justpainful.glasslab
+        PRODUCT_NAME: GlassLab
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        ARCHS: arm64
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: GlassLab/Resources/Info.plist
+        SWIFT_EMIT_LOC_STRINGS: YES
+        DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+  GlassLabTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: GlassLabTests
+    dependencies:
+      - target: GlassLab
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.justpainful.glasslab.tests
+        GENERATE_INFOPLIST_FILE: YES
+  GlassLabUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: GlassLabUITests
+    dependencies:
+      - target: GlassLab
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.justpainful.glasslab.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: GlassLab
+schemes:
+  GlassLab:
+    build:
+      targets:
+        GlassLab: all
+        GlassLabTests: [test]
+        GlassLabUITests: [test]
+    test:
+      config: Debug
+      gatherCoverageData: true
+      targets:
+        - GlassLabTests
+        - GlassLabUITests
+    archive:
+      config: Release

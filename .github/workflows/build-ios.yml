@@ -1,0 +1,296 @@
+name: Build iOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      export_method:
+        description: "Distribution method for the signed IPA"
+        type: choice
+        default: development
+        options: [development, ad-hoc, app-store-connect]
+      run_ui_tests:
+        description: "Run UI tests on the simulator"
+        type: boolean
+        default: true
+      upload_testflight:
+        description: "Upload to TestFlight (app-store-connect method + API key secrets required)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned: the newest Xcode on the macos-26 image when this workflow was written (iOS 26.5 SDK).
+  XCODE_VERSION: "26.6"
+  MIN_IOS_SDK: "26.0"
+  SIM_DEVICE: "iPhone 17 Pro"
+  SCHEME: GlassLab
+
+jobs:
+  test:
+    name: Build & test (simulator)
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          XC="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "$XC" ]; then echo "::error::$XC is not installed on this runner image"; ls -d /Applications/Xcode*.app; exit 1; fi
+          sudo xcode-select -s "$XC/Contents/Developer"
+
+      - name: Verify toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iOS SDK $SDK"
+          python3 -c "import sys; a=[int(x) for x in '$SDK'.split('.')]; b=[int(x) for x in '$MIN_IOS_SDK'.split('.')]; sys.exit(0 if a>=b else 1)" \
+            || { echo "::error::iOS SDK $SDK is older than $MIN_IOS_SDK (Liquid Glass APIs need the iOS 26 SDK)"; exit 1; }
+          xcrun simctl list runtimes | grep -i ios
+
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate project & resolve dependencies
+        run: |
+          xcodegen generate
+          xcodebuild -resolvePackageDependencies -project GlassLab.xcodeproj -scheme "$SCHEME"
+
+      - name: Build for testing
+        run: |
+          mkdir -p build/logs
+          set -o pipefail
+          xcodebuild build-for-testing -project GlassLab.xcodeproj -scheme "$SCHEME" \
+            -destination "platform=iOS Simulator,name=${SIM_DEVICE},OS=latest" \
+            -derivedDataPath build/dd > build/logs/build-for-testing.log 2>&1 \
+            || { grep -E "error:|warning: .*(deprecated|unavailable)" build/logs/build-for-testing.log | sort -u | head -150; tail -60 build/logs/build-for-testing.log; exit 1; }
+          grep -c "warning:" build/logs/build-for-testing.log || true
+
+      - name: Unit & integration tests
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building -project GlassLab.xcodeproj -scheme "$SCHEME" \
+            -destination "platform=iOS Simulator,name=${SIM_DEVICE},OS=latest" \
+            -derivedDataPath build/dd -only-testing:GlassLabTests \
+            -resultBundlePath build/UnitTests.xcresult > build/logs/unit-tests.log 2>&1 \
+            || { grep -E "error:|failed|Failing|XCTAssert" build/logs/unit-tests.log | head -120; tail -40 build/logs/unit-tests.log; exit 1; }
+          grep -E "Executed [0-9]+ tests" build/logs/unit-tests.log | tail -1
+
+      - name: UI tests
+        if: github.event_name != 'workflow_dispatch' || inputs.run_ui_tests
+        # UI tests check navigation on the simulator; they are reported but do not block the IPA.
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building -project GlassLab.xcodeproj -scheme "$SCHEME" \
+            -destination "platform=iOS Simulator,name=${SIM_DEVICE},OS=latest" \
+            -derivedDataPath build/dd -only-testing:GlassLabUITests \
+            -resultBundlePath build/UITests.xcresult > build/logs/ui-tests.log 2>&1 \
+            || { grep -E "error:|failed|Failing" build/logs/ui-tests.log | head -80; exit 1; }
+          grep -E "Executed [0-9]+ tests" build/logs/ui-tests.log | tail -1
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            build/*.xcresult
+            build/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  archive:
+    name: Archive & export IPA
+    needs: test
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      EXPORT_METHOD: ${{ inputs.export_method || 'development' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer" && xcodebuild -version
+
+      - name: Install XcodeGen & generate project
+        run: brew install xcodegen && xcodegen generate
+
+      - name: Detect signing material
+        id: secrets
+        env:
+          P12: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$P12" ] && [ -n "$PROFILE" ] && [ -n "$TEAM" ]; then
+            echo "signing=true" >> "$GITHUB_OUTPUT"; echo "Signing secrets present (values not shown)."
+          else
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No signing secrets. An UNSIGNED archive is produced; it cannot be installed on a regular iOS device."
+          fi
+
+      - name: Install certificate & provisioning profile
+        if: steps.secrets.outputs.signing == 'true'
+        id: signing
+        env:
+          P12: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KC_PASS="$(openssl rand -hex 24)"
+          echo "::add-mask::$KC_PASS"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "$PROFILE" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "${P12_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" "$RUNNER_TEMP/profile.plist")
+          NAME=$(/usr/libexec/PlistBuddy -c "Print Name" "$RUNNER_TEMP/profile.plist")
+          APPID=$(/usr/libexec/PlistBuddy -c "Print Entitlements:application-identifier" "$RUNNER_TEMP/profile.plist")
+          BUNDLE="${APPID#*.}"
+          if [ "$BUNDLE" = "*" ] || [ -z "$BUNDLE" ]; then BUNDLE="com.justpainful.glasslab"; fi
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep -oE '"[^"]+"' | head -1 | tr -d '"')
+          echo "Profile: $NAME, bundle id: $BUNDLE"
+          echo "uuid=$UUID" >> "$GITHUB_OUTPUT"
+          echo "bundle=$BUNDLE" >> "$GITHUB_OUTPUT"
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Archive (signed)
+        if: steps.secrets.outputs.signing == 'true'
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          mkdir -p build/logs
+          set -o pipefail
+          xcodebuild archive -project GlassLab.xcodeproj -scheme "$SCHEME" -configuration Release \
+            -destination "generic/platform=iOS" -archivePath build/GlassLab.xcarchive \
+            CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$TEAM" \
+            PRODUCT_BUNDLE_IDENTIFIER="${{ steps.signing.outputs.bundle }}" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ steps.signing.outputs.uuid }}" \
+            CODE_SIGN_IDENTITY="${{ steps.signing.outputs.identity }}" \
+            OTHER_CODE_SIGN_FLAGS="--keychain ${{ steps.signing.outputs.keychain }}" > build/logs/archive.log 2>&1 \
+            || { grep -E "error:" build/logs/archive.log | sort -u | head -80; tail -40 build/logs/archive.log; exit 1; }
+
+      - name: Export IPA (signed)
+        if: steps.secrets.outputs.signing == 'true'
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          case "$EXPORT_METHOD" in
+            ad-hoc) METHOD=release-testing ;;
+            app-store-connect) METHOD=app-store-connect ;;
+            *) METHOD=debugging ;;
+          esac
+          cat > build/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>${METHOD}</string>
+            <key>teamID</key><string>${TEAM}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>${{ steps.signing.outputs.identity }}</string>
+            <key>provisioningProfiles</key><dict><key>${{ steps.signing.outputs.bundle }}</key><string>${{ steps.signing.outputs.uuid }}</string></dict>
+            <key>compileBitcode</key><false/>
+            <key>stripSwiftSymbols</key><true/>
+          </dict></plist>
+          EOF
+          set -o pipefail
+          xcodebuild -exportArchive -archivePath build/GlassLab.xcarchive -exportPath build/ipa \
+            -exportOptionsPlist build/ExportOptions.plist > build/logs/export.log 2>&1 \
+            || { grep -E "error" build/logs/export.log | head -40; tail -40 build/logs/export.log; exit 1; }
+          ls -la build/ipa
+
+      - name: Archive (unsigned)
+        if: steps.secrets.outputs.signing != 'true'
+        run: |
+          mkdir -p build/logs build/ipa
+          set -o pipefail
+          xcodebuild archive -project GlassLab.xcodeproj -scheme "$SCHEME" -configuration Release \
+            -destination "generic/platform=iOS" -archivePath build/GlassLab.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" > build/logs/archive.log 2>&1 \
+            || { grep -E "error:" build/logs/archive.log | sort -u | head -80; tail -40 build/logs/archive.log; exit 1; }
+          # Package the .app as an IPA-shaped zip. It is UNSIGNED: it cannot be installed on a normal device
+          # without re-signing with your own certificate and provisioning profile.
+          cd build && rm -rf Payload && mkdir Payload
+          cp -R GlassLab.xcarchive/Products/Applications/GlassLab.app Payload/
+          zip -qry ipa/GlassLab-UNSIGNED.ipa Payload && rm -rf Payload
+
+      - name: Verify output
+        run: |
+          set -e
+          IPA=$(ls build/ipa/*.ipa | head -1)
+          echo "IPA: $IPA ($(du -h "$IPA" | cut -f1))"
+          unzip -l "$IPA" | grep -E "Payload/GlassLab.app/(GlassLab|Info.plist)$"
+          rm -rf build/verify && mkdir -p build/verify && unzip -q "$IPA" -d build/verify
+          APP=build/verify/Payload/GlassLab.app
+          /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" -c "Print CFBundleShortVersionString" -c "Print MinimumOSVersion" -c "Print DTSDKName" "$APP/Info.plist"
+          lipo -info "$APP/GlassLab"
+          if codesign -dv "$APP" 2>&1 | grep -q "Authority="; then
+            codesign -dv --verbose=2 "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|Identifier" | head -5
+            codesign --verify --deep --strict "$APP" && echo "Signature verified"
+          else
+            echo "::warning::IPA is not signed with a distribution identity"
+          fi
+          cd build/GlassLab.xcarchive && zip -qry ../GlassLab-dSYMs.zip dSYMs && ls -la ../GlassLab-dSYMs.zip
+
+      - name: Upload to TestFlight
+        if: steps.secrets.outputs.signing == 'true' && inputs.upload_testflight && inputs.export_method == 'app-store-connect'
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_KEY_P8_BASE64 }}
+        run: |
+          if [ -z "$ASC_KEY_ID" ] || [ -z "$ASC_ISSUER_ID" ] || [ -z "$ASC_KEY_P8_BASE64" ]; then echo "::error::App Store Connect API key secrets are missing"; exit 1; fi
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          echo "$ASC_KEY_P8_BASE64" | base64 --decode > "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          xcrun altool --upload-app -f build/ipa/*.ipa -t ios --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.secrets.outputs.signing == 'true' && format('GlassLab-ipa-{0}', env.EXPORT_METHOD) || 'GlassLab-UNSIGNED-ipa' }}
+          path: build/ipa/*.ipa
+          retention-days: 30
+
+      - name: Upload dSYMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlassLab-dSYMs
+          path: build/GlassLab-dSYMs.zip
+          retention-days: 30
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-logs
+          path: build/logs/
+          if-no-files-found: ignore
+
+      - name: Clean up signing material
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/signing.keychain-db" ]; then security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true; fi
+          rm -f "$RUNNER_TEMP"/*.mobileprovision "$RUNNER_TEMP"/profile.plist "$RUNNER_TEMP"/cert.p12
+          rm -rf "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/.appstoreconnect/private_keys"
