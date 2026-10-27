@@ -176,7 +176,9 @@ enum ResourceGuard {
         if !thermalAllowsHeavyWork {
             throw GlassLabError.thermalLimit("thermal state is \(DeviceEnvironmentMonitor.thermalName(ProcessInfo.processInfo.thermalState))")
         }
-        if estimatedBytes > 0 && estimatedBytes > MemoryProbe.availableForProcess() / 2 {
+        // os_proc_available_memory() returns 0 where no limit applies (e.g. the simulator): treat as unknown.
+        let available = MemoryProbe.availableForProcess()
+        if estimatedBytes > 0 && available > 0 && estimatedBytes > available / 2 {
             throw GlassLabError.invalidData("operation needs ~\(Format.bytes(estimatedBytes)), more than half of the memory available to the app")
         }
     }
