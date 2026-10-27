@@ -405,8 +405,21 @@ struct TabDemo: View {
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
-        .tabViewBottomAccessory(isEnabled: accessory) {
-            HStack { Image(systemName: "music.note"); Text("Now Playing"); Spacer(); Image(systemName: "play.fill") }.padding(.horizontal)
+        .modifier(BottomAccessory(enabled: accessory))
+    }
+}
+
+/// `tabViewBottomAccessory(isEnabled:)` is iOS 26.1+; iOS 26.0 only has the unconditional form.
+struct BottomAccessory: ViewModifier {
+    var enabled: Bool
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.tabViewBottomAccessory {
+                HStack { Image(systemName: "music.note"); Text("Now Playing"); Spacer(); Image(systemName: "play.fill") }.padding(.horizontal)
+            }
+        } else {
+            content
         }
     }
 }
